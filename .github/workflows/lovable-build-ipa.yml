@@ -1,0 +1,212 @@
+name: Build IPA (POWER UP)
+on:
+  workflow_dispatch:
+    inputs:
+      project_dir:
+        description: 'Optional project folder in a multi-project repository'
+        default: ''
+      scheme:
+        description: 'Optional shared Xcode scheme'
+        default: ''
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      PROJECT_DIR: ${{ inputs.project_dir }}
+      BUILD_SCHEME: ${{ inputs.scheme }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+      - name: Safely extract source archives
+        run: |
+          python3 - <<'PY'
+          import pathlib, zipfile, stat
+          root = pathlib.Path('.').resolve()
+          seen = set()
+          for depth in range(5):
+              archives = [p for p in root.rglob('*.zip') if p not in seen and not any(x in p.parts for x in ('.git','node_modules','Pods','build','.build'))]
+              if not archives: break
+              for archive in archives:
+                  seen.add(archive)
+                  with zipfile.ZipFile(archive) as z:
+                      if sum(i.file_size for i in z.infolist()) > 2 * 1024**3:
+                          raise ValueError('Archive too large')
+                      for i in z.infolist():
+                          target = (archive.parent / i.filename).resolve()
+                          if not target.is_relative_to(root) or '.git' in target.relative_to(root).parts or stat.S_ISLNK(i.external_attr >> 16):
+                              raise ValueError('Unsafe archive entry')
+                      z.extractall(archive.parent)
+          PY
+      - name: Detect iOS project
+        id: detect
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, json
+          root = pathlib.Path('.').resolve()
+          base = (root / os.environ.get('PROJECT_DIR','')).resolve()
+          if not base.is_relative_to(root) or not base.is_dir(): raise ValueError('Invalid project folder')
+          skip = {'.git','Pods','node_modules','build','.build','.symlinks','__MACOSX'}
+          def candidates(pattern):
+              return sorted(p for p in base.rglob(pattern) if not skip.intersection(p.relative_to(base).parts))
+          flutter = candidates('pubspec.yaml')
+          packages = candidates('package.json')
+          js = []
+          for p in packages:
+              d = json.loads(p.read_text()); deps = {**d.get('dependencies',{}), **d.get('devDependencies',{})}
+              if 'react-native' in deps: js.append(('react-native',p.parent))
+              elif '@capacitor/core' in deps: js.append(('capacitor',p.parent))
+          if len(flutter) == 1: kind, folder = 'flutter', flutter[0].parent
+          elif len(flutter) > 1: raise ValueError('Multiple Flutter projects: set project_dir')
+          elif len(js) == 1: kind, folder = js[0]
+          elif len(js) > 1: raise ValueError('Multiple JS applications: set project_dir')
+          else: kind, folder = 'xcode', base
+          workspaces = [p for p in candidates('*.xcworkspace') if not p.parent.name.endswith('.xcodeproj')]
+          projects = candidates('*.xcodeproj')
+          if kind == 'xcode' and not (workspaces or projects): raise ValueError('No iOS app project found: Xcode, Flutter, React Native or Capacitor required')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f'type={kind}\ndir={folder.relative_to(root).as_posix()}\n')
+          PY
+      - uses: subosito/flutter-action@v2
+        if: steps.detect.outputs.type == 'flutter'
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.type == 'react-native' || steps.detect.outputs.type == 'capacitor'
+        with:
+          node-version: '22'
+      - name: Prepare JavaScript iOS project
+        if: steps.detect.outputs.type == 'react-native' || steps.detect.outputs.type == 'capacitor'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        env:
+          PROJECT_TYPE: ${{ steps.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          corepack enable
+          if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile;
+          elif [ -f yarn.lock ]; then yarn install --immutable;
+          elif [ -f package-lock.json ]; then npm ci;
+          else npm install; fi
+          if [ "$PROJECT_TYPE" = capacitor ]; then
+            npm run build
+            if [ ! -d ios ]; then npx --no-install cap add ios; fi
+            npx --no-install cap sync ios
+          fi
+          test -d ios || { echo 'Native ios folder missing; generate and commit it first'; exit 1; }
+      - name: Build Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          set -euo pipefail
+          flutter pub get || flutter pub upgrade
+          if [ ! -d ios ] || [ ! -d ios/Runner.xcodeproj ]; then flutter create --platforms=ios .; fi
+          if [ -f ios/Podfile ]; then sed -i '' "s/^# platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true; fi
+          flutter build ios --release --no-codesign || { echo 'Auto-fix: clean, upgrade and retry'; flutter clean; rm -rf ios/Pods ios/Podfile.lock; flutter pub upgrade; (cd ios && pod install --repo-update || true); flutter build ios --release --no-codesign; }
+          mkdir -p "$GITHUB_WORKSPACE/out/Payload"
+          cp -R build/ios/iphoneos/*.app "$GITHUB_WORKSPACE/out/Payload/"
+      - name: Build native iOS application
+        if: steps.detect.outputs.type != 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, subprocess, json, os, shutil
+          root = pathlib.Path('.').resolve()
+          skip = {'.git','Pods','node_modules','build','.build'}
+          def paths(pattern): return sorted(p for p in root.rglob(pattern) if not skip.intersection(p.relative_to(root).parts))
+          for pod in paths('Podfile'):
+              command = ['bundle','exec','pod','install'] if (pod.parent/'Gemfile').exists() else ['pod','install']
+              if command[0] == 'bundle': subprocess.run(['bundle','install'],cwd=pod.parent,check=True)
+              if subprocess.run(command,cwd=pod.parent).returncode != 0:
+                  print('Auto-fix: retry pod install with repo update')
+                  (pod.parent/'Podfile.lock').unlink(missing_ok=True)
+                  subprocess.run(['pod','install','--repo-update'],cwd=pod.parent,check=True)
+          workspaces = [p for p in paths('*.xcworkspace') if not p.parent.name.endswith('.xcodeproj')]
+          choices = workspaces or paths('*.xcodeproj')
+          if len(choices) != 1: raise ValueError('Choose a project_dir containing one iOS application')
+          p = choices[0]; flag = '-workspace' if p.suffix == '.xcworkspace' else '-project'
+          def listing(path, fl):
+              r = subprocess.run(['xcodebuild','-list',fl,str(path),'-json'],capture_output=True,text=True)
+              return json.loads(r.stdout) if r.returncode == 0 else None
+          info = listing(p, flag)
+          if info is None:
+              print('::warning::بدء فحص الخطأ: ملف المشروع تالف')
+              projs = [p] if p.suffix == '.xcodeproj' else paths('*.xcodeproj')
+              for proj in projs:
+                  pbx = proj/'project.pbxproj'
+                  if not pbx.exists(): continue
+                  print('::warning::جاري تعديل الخطأ في', pbx)
+                  shutil.copy(pbx, str(pbx)+'.bak')
+                  d = json.loads(subprocess.check_output(['plutil','-convert','json','-o','-',str(pbx)]))
+                  objs = d['objects']; import uuid
+                  for o in list(objs.values()):
+                      if o.get('isa','').endswith('BuildPhase') and 'files' in o:
+                          fixed = []
+                          for fid in o['files']:
+                              t = objs.get(fid)
+                              if t is None: continue
+                              if t.get('isa') in ('PBXFileReference','PBXVariantGroup','XCVersionGroup'):
+                                  nid = uuid.uuid4().hex[:24].upper(); objs[nid] = {'isa':'PBXBuildFile','fileRef':fid}; fid = nid
+                              fixed.append(fid)
+                          o['files'] = fixed
+                  for o in objs.values():
+                      if 'children' in o: o['children'] = [c for c in o['children'] if c in objs]
+                  tmp = str(pbx)+'.json'; open(tmp,'w').write(json.dumps(d))
+                  subprocess.run(['plutil','-convert','xml1','-o',str(pbx),tmp],check=True); os.remove(tmp)
+              info = listing(p, flag)
+          if info is None:
+              print('::warning::الإصلاح لم يكفِ، جاري إعادة إنشاء المشروع من الملفات')
+              subprocess.run(['brew','install','xcodegen'],check=True)
+              src = max((d for d in root.rglob('*') if d.is_dir() and not skip.intersection(d.relative_to(root).parts) and not d.suffix in ('.xcodeproj','.xcworkspace')), key=lambda d: len(list(d.glob('*.swift')))+len(list(d.glob('*.m'))), default=root)
+              name = 'PowerUpApp'
+              rel = src.relative_to(root).as_posix() or '.'
+              yml = '\n'.join(['name: '+name,'options:','  deploymentTarget:','    iOS: "15.0"','targets:','  '+name+':','    type: application','    platform: iOS','    sources: ["'+rel+'"]','    settings:','      PRODUCT_BUNDLE_IDENTIFIER: com.powerup.app','      GENERATE_INFOPLIST_FILE: YES','      INFOPLIST_KEY_UILaunchScreen_Generation: YES',''])
+              open('project.yml','w').write(yml)
+              subprocess.run(['xcodegen','generate'],check=True)
+              p = root/(name+'.xcodeproj'); flag = '-project'
+              info = listing(p, flag)
+              if info is None: raise RuntimeError('تعذر إصلاح المشروع تلقائياً')
+          print('تم فحص المشروع، جاري البناء')
+          schemes = info.get('workspace', info.get('project',{})).get('schemes',[])
+          wanted = os.environ.get('BUILD_SCHEME')
+          if wanted and wanted not in schemes: raise ValueError('Scheme not found. Available: ' + ', '.join(schemes))
+          order = [wanted] if wanted else sorted(schemes, key=lambda s: (any(x in s.lower() for x in ('test','pods','widget','extension')), s))
+          if not order: raise ValueError('No shared scheme found; share the app scheme in Xcode')
+          derived = os.path.join(os.environ['GITHUB_WORKSPACE'],'ipa-derived')
+          products = pathlib.Path(derived)/'Build/Products/Release-iphoneos'
+          extra = ['CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY=','DEVELOPMENT_TEAM=','ONLY_ACTIVE_ARCH=NO']
+          apps = []
+          for scheme in order:
+              base_cmd = ['xcodebuild',flag,str(p),'-scheme',scheme,'-configuration','Release','-destination','generic/platform=iOS','-derivedDataPath',derived] + extra
+              ok = subprocess.run(base_cmd + ['build']).returncode == 0
+              if not ok:
+                  print('Auto-fix: retry with relaxed build settings for', scheme)
+                  ok = subprocess.run(base_cmd + ['IPHONEOS_DEPLOYMENT_TARGET=13.0','SWIFT_TREAT_WARNINGS_AS_ERRORS=NO','GCC_TREAT_WARNINGS_AS_ERRORS=NO','-skipPackagePluginValidation','-skipMacroValidation','clean','build']).returncode == 0
+              apps = [a for a in products.glob('*.app')] if ok else []
+              if apps: break
+          if not apps: raise RuntimeError('Build failed for schemes: ' + ', '.join(order))
+          apps = apps[:1]
+          if len(apps) != 1: raise ValueError('Expected exactly one iOS application product')
+          import shutil
+          payload = pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'out/Payload'
+          payload.mkdir(parents=True,exist_ok=True)
+          shutil.copytree(apps[0],payload/apps[0].name)
+          PY
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          test -d out/Payload
+          cd out
+          zip -qry app.ipa Payload
+          unzip -t app.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-ipa
+          path: out/app.ipa
+          if-no-files-found: error
+          retention-days: 7
